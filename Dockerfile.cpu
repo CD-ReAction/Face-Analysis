@@ -1,0 +1,70 @@
+# CPU-only image for running the analyzer as an always-on FastAPI server
+# (no RunPod, no GPU). Intended for demos with DEMO_FAST_MODE=1, where a
+# 10s clip analyzes in well under a second on CPU and the always-on process
+# removes RunPod queue / cold-start latency entirely.
+#
+#   docker build -f Dockerfile.cpu --platform linux/amd64 -t face-analyzer:cpu .
+#   docker run --rm -p 8000:8000 --env-file .env face-analyzer:cpu
+#
+# The GPU/RunPod image is still ./Dockerfile; this one does not touch it.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV NO_ALBUMENTATIONS_UPDATE=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Force CPU everywhere: torch/YOLO on cpu, ONNX on the CPU provider.
+ENV FACE_ANALYZER_DEVICE=cpu
+ENV FACE_ANALYZER_ONNX_PROVIDERS=CPUExecutionProvider
+# Load YOLO + InsightFace once at startup and reuse them per request
+# (see app/main.py). Without this every request pays the model load.
+ENV FACE_ANALYZER_PRELOAD=1
+# Demo fast path on by default for this image; override with -e DEMO_FAST_MODE=0.
+ENV DEMO_FAST_MODE=1
+
+WORKDIR /app
+
+# libgl1/libglib2.0-0: opencv-python runtime deps.
+# ffmpeg: used by the video reader's MKV remux fallback for webm inputs.
+# build-essential: insightface 0.7.3 ships as an sdist with a Cython extension.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+# 1) CPU-only torch first, so ultralytics doesn't pull the multi-GB CUDA build.
+# 2) Swap onnxruntime-gpu for the plain CPU onnxruntime (same version range).
+# 3) numpy before insightface: its setup.py imports numpy at build time.
+# 4) decord's PyPI wheel is CPU-only and x86_64-only; the reader falls back to
+#    OpenCV without it, so a missing wheel (e.g. arm64 build) is not fatal.
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch torchvision \
+    && grep -v '^onnxruntime-gpu' requirements.txt > /tmp/requirements-cpu.txt \
+    && echo 'onnxruntime>=1.25.1,<1.27' >> /tmp/requirements-cpu.txt \
+    && pip install --no-cache-dir numpy cython \
+    && pip install --no-cache-dir -r /tmp/requirements-cpu.txt \
+    && (pip install --no-cache-dir decord==0.6.0 \
+        || echo "decord wheel unavailable for this platform; using OpenCV reader") \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -f /tmp/requirements-cpu.txt
+
+# Pre-fetch model weights so the container starts without network downloads.
+RUN python -c "from insightface.app import FaceAnalysis; \
+FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'], allowed_modules=['detection','recognition'])"
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
+
+COPY app ./app
+
+EXPOSE 8000
+
+# Single worker on purpose: the preloaded analyzer is shared and serialized
+# with a lock, and extra workers would each load their own copy of the models.
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

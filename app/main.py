@@ -1,7 +1,57 @@
+import logging
+import os
+import threading
+from contextlib import asynccontextmanager
+
 from fastapi import BackgroundTasks, FastAPI, status
 from pydantic import BaseModel, Field, HttpUrl
 
-from app.services.face_analysis.worker import run_analysis_job
+from app.services.face_analysis.analyzer import FaceVideoAnalyzer
+from app.services.face_analysis.worker import _resolve_accelerator, run_analysis_job
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Opt-in (FACE_ANALYZER_PRELOAD=1, set by Dockerfile.cpu): load the models once
+# at startup and reuse them for every request, like app/handler.py does for
+# RunPod. Off by default so the API keeps building a fresh analyzer per job.
+_analyzer: FaceVideoAnalyzer | None = None
+# The analyzer is stateful (PersonTracker), so a shared instance must only
+# run one job at a time.
+_analyzer_lock = threading.Lock()
+
+
+def _preload_enabled() -> bool:
+    return os.getenv("FACE_ANALYZER_PRELOAD", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _analyzer
+    if _preload_enabled():
+        device, onnx_providers = _resolve_accelerator()
+        logger.info(
+            "Preloading analyzer: device=%s onnx_providers=%s",
+            device or "cpu",
+            onnx_providers or ["CPUExecutionProvider"],
+        )
+        analyzer = FaceVideoAnalyzer(device=device, onnx_providers=onnx_providers)
+        analyzer.warmup()
+        _analyzer = analyzer
+    yield
+
+
+def _run_job(payload: dict) -> None:
+    if _analyzer is None:
+        run_analysis_job(payload)
+        return
+    with _analyzer_lock:
+        run_analysis_job(payload, analyzer=_analyzer)
 
 
 class KnownActorPayload(BaseModel):
@@ -37,6 +87,7 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 
@@ -54,7 +105,7 @@ def analyze(
     request: AnalyzeRequest,
     background_tasks: BackgroundTasks,
 ) -> AnalyzeAcceptedResponse:
-    background_tasks.add_task(run_analysis_job, request.model_dump(mode="json"))
+    background_tasks.add_task(_run_job, request.model_dump(mode="json"))
     return AnalyzeAcceptedResponse(
         video_id=request.video_id,
         analysis_status="accepted",
