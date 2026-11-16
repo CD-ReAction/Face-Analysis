@@ -313,6 +313,19 @@ RunPod webhook은 사용하지 않습니다. 이 worker는 BE가 넘긴 `callbac
 세부 튜닝은 `DEMO_MAX_FRAMES` 등 위 [Environment Variables](#environment-variables)
 섹션 참고. 기본값은 OFF라서 변수를 안 넣으면 평소 파이프라인 그대로 돕니다.
 
+### CPU 상시 서버로 데모하기 (`Dockerfile.cpu`)
+
+RunPod 콜드스타트/대기열 없이 데모하려면 CPU 이미지를 상시 실행 서버로 띄웁니다.
+`DEMO_FAST_MODE=1`, `FACE_ANALYZER_PRELOAD=1`(시작 시 모델 1회 로딩)이 기본으로 켜져 있습니다.
+
+```bash
+docker build -f Dockerfile.cpu --platform linux/amd64 -t face-analyzer:cpu .
+docker run -d -p 8000:8000 --env-file .env face-analyzer:cpu
+```
+
+BE는 RunPod 대신 `POST http://<host>:8000/analyze`로 같은 payload를 보내면 되고,
+결과는 기존과 동일하게 `callback_url`로 옵니다. job은 한 번에 하나씩 처리됩니다.
+
 ## Test
 
 Unit test:
